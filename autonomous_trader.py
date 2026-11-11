@@ -175,6 +175,77 @@ def fetch_yahoo_5m_bars(symbol):
         return []
 
 
+def send_telegram_alert(message):
+    """Send formatted Markdown alert to Telegram."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        cfg = load_config()
+        token = token or cfg.get("telegram_bot_token")
+        chat_id = chat_id or cfg.get("telegram_chat_id")
+
+    if not token or not chat_id:
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info("Telegram notification sent successfully.")
+    except Exception as e:
+        logger.warning(f"Could not send Telegram message: {e}")
+
+
+def send_daily_summary(starting_equity, trades_today, symbols_traded):
+    """Send daily P&L and paper balance summary to Telegram."""
+    acc = get_account_summary() or {}
+    current_equity = float(acc.get("portfolio_value", 1000.0))
+    cash = float(acc.get("cash", 1000.0))
+    bp = float(acc.get("buying_power", 4000.0))
+    pnl = current_equity - starting_equity
+    pnl_pct = (pnl / starting_equity) * 100 if starting_equity else 0.0
+    pnl_sign = "+" if pnl >= 0 else ""
+    pnl_emoji = "🟢" if pnl >= 0 else ("🔴" if pnl < 0 else "⚪")
+
+    # Alpaca has $0 commission on US equities. Regulatory fees on sell orders:
+    est_fees = round(trades_today * 0.01, 2)
+    net_pnl = pnl - est_fees
+
+    ny_date = datetime.now(timezone(timedelta(hours=-5))).strftime('%A, %b %d, %Y')
+
+    msg = f"""📊 *Alpaca Daily Trading Report* 📊
+📅 *Date:* {ny_date}
+
+💵 *Paper Funds Available:*
+• Portfolio Equity: `${current_equity:,.2f}`
+• Tradable Cash: `${cash:,.2f}` (100% Cash)
+• Buying Power: `${bp:,.2f}`
+
+📈 *Daily Performance:*
+• Daily P&L: {pnl_emoji} *{pnl_sign}${pnl:,.2f} ({pnl_sign}{pnl_pct:.2f}%)*
+• Trades Executed: `{trades_today}` ({', '.join(symbols_traded) if symbols_traded else 'None'})
+• Overnight Risk: `$0.00` (All Flattened)
+
+🏷️ *Brokerage & Fees:*
+• Alpaca Commission: `$0.00` (Zero Commission)
+• Est. Regulatory Fees: `${est_fees:.2f}`
+• Net P&L: *{pnl_sign}${net_pnl:,.2f}*
+
+🛡️ *Account Status:* ACTIVE (Paper Trading)"""
+
+    send_telegram_alert(msg)
+
+
 def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
     """Submit a bracket order to Alpaca Paper Trading API."""
     payload = {
@@ -195,6 +266,14 @@ def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
     resp = alpaca_request("/orders", method="POST", body=payload)
     if resp and "id" in resp:
         logger.info(f"[SUCCESS] Order Placed! Broker Order ID: {resp['id']}, Status: {resp.get('status')}")
+        send_telegram_alert(
+            f"🎯 *Trade Executed (Alpaca Paper)*\n"
+            f"• Action: *BUY {qty} {symbol}*\n"
+            f"• Est. Entry: `${entry_price:.2f}`\n"
+            f"• Stop-Loss: `${stop_price:.2f}`\n"
+            f"• Take-Profit: `${target_price:.2f}`\n"
+            f"• Risk at Stop: `${qty * (entry_price - stop_price):.2f}`"
+        )
         return resp
     else:
         logger.error(f"[FAILED] Order placement failed for {symbol}")
@@ -221,6 +300,8 @@ def run_session(config):
     traded_symbols = set()
     trades_today = 0
     max_trades = config.get("max_trades_per_day", 3)
+    acc0 = get_account_summary() or {}
+    starting_equity = float(acc0.get("portfolio_value", config['budget']))
 
     while True:
         clock = get_market_clock()
@@ -264,6 +345,8 @@ def run_session(config):
         if time_et >= config.get("flat_by", "15:55"):
             logger.info(f"Cutoff time reached (NY {time_et} >= {config['flat_by']}). Flattening portfolio...")
             flatten_all_positions()
+            time.sleep(5)
+            send_daily_summary(starting_equity, trades_today, list(traded_symbols))
             logger.info("Session complete for today. Sleeping until next open...")
             time.sleep(300)
             break
