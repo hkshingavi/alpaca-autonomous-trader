@@ -1,0 +1,32 @@
+name: Autonomous US Day Trading Session
+
+on:
+  schedule:
+    # 14:15 UTC = 09:15 AM EST (15 min before NYSE opens), Monday to Friday
+    - cron: '15 14 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-trading-session:
+    name: Execute Day Trading Session
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Autonomous Day Trading Bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER_TRADE: ${{ secrets.ALPACA_PAPER_TRADE }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          echo "Starting Autonomous Trading Bot on GitHub Actions Runner..."
+          python autonomous_trader.py
