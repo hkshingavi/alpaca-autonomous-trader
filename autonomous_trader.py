@@ -246,6 +246,69 @@ def send_daily_summary(starting_equity, trades_today, symbols_traded):
     send_telegram_alert(msg)
 
 
+def check_and_update_breakeven(active_trades):
+    """
+    Check if any active position has gained +1R.
+    If so, update the open stop-loss order on Alpaca to entry price (Break-Even).
+    """
+    if not active_trades:
+        return
+
+    positions = alpaca_request("/positions") or []
+    if not positions:
+        return
+
+    open_orders = alpaca_request("/orders?status=open") or []
+    pos_dict = {p.get("symbol"): p for p in positions}
+
+    for symbol, trade in list(active_trades.items()):
+        if trade.get("be_moved"):
+            continue
+
+        pos = pos_dict.get(symbol)
+        if not pos:
+            continue
+
+        entry_px = float(trade["entry"])
+        initial_stop = float(trade["initial_stop"])
+        risk = entry_px - initial_stop
+
+        if risk <= 0:
+            continue
+
+        current_px = float(pos.get("current_price", 0.0))
+        target_1r = entry_px + risk
+
+        # Has the stock gained +1R?
+        if current_px >= target_1r:
+            # Find the matching open stop-loss order
+            stop_order = None
+            for o in open_orders:
+                if o.get("symbol") == symbol and o.get("side") == "sell" and o.get("type") == "stop":
+                    stop_order = o
+                    break
+
+            if stop_order and "id" in stop_order:
+                stop_order_id = stop_order["id"]
+                new_stop = round(entry_px + 0.02, 2)  # Entry + 2 cents to cover regulatory fees
+                logger.info(f"*** +1R REACHED FOR {symbol} (${current_px:.2f} >= ${target_1r:.2f}) ***")
+                logger.info(f"Modifying Stop-Loss from ${initial_stop:.2f} to Break-Even (${new_stop:.2f})...")
+
+                patch_payload = {"stop_price": f"{new_stop:.2f}"}
+                resp = alpaca_request(f"/orders/{stop_order_id}", method="PATCH", body=patch_payload)
+
+                if resp and "id" in resp:
+                    trade["be_moved"] = True
+                    logger.info(f"[SUCCESS] Break-Even Stop confirmed on Alpaca! New Order ID: {resp['id']}")
+                    send_telegram_alert(
+                        f"🛡️ *Break-Even Protection Activated!*\n"
+                        f"• Stock: *{symbol}*\n"
+                        f"• Current Price: *${current_px:.2f}* (+1R Milestone)\n"
+                        f"• Stop Moved To: *${new_stop:.2f}* (Entry)\n"
+                        f"• Remaining Risk: *$0.00 (Risk-Free Trade!)*"
+                    )
+
+
 def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
     """Submit a bracket order to Alpaca Paper Trading API with idempotent client_order_id."""
     today_str = datetime.now(timezone(timedelta(hours=-5))).strftime("%Y%m%d")
@@ -302,6 +365,7 @@ def run_session(config):
 
     symbols = config.get("tickers", ["NVDA", "AMZN", "INTC", "AAPL", "MSFT", "AMD", "PLTR", "TSLA"])
     traded_symbols = set()
+    active_trades = {}
     trades_today = 0
     max_trades = config.get("max_trades_per_day", 3)
     acc0 = get_account_summary() or {}
@@ -361,6 +425,9 @@ def run_session(config):
             time.sleep(60)
             continue
 
+        # Check and manage open trades (Move stop to Break-Even at +1R)
+        check_and_update_breakeven(active_trades)
+
         # Case 5: Daily trade limit reached
         if trades_today >= max_trades:
             logger.info(f"Daily trade limit reached ({trades_today}/{max_trades}). Monitoring...")
@@ -394,14 +461,31 @@ def run_session(config):
 
             if latest_close > or_high:
                 entry_price = latest_close
-                stop_price = round(or_mid, 2)
-                risk_per_share = entry_price - stop_price
 
-                if risk_per_share <= 0.05:
-                    continue
+                # Compute Average True Range (ATR) across the 15-minute bars
+                trs = []
+                for i in range(len(or_bars)):
+                    tr = or_bars[i]["high"] - or_bars[i]["low"]
+                    if i > 0:
+                        prev_c = or_bars[i - 1]["close"]
+                        tr = max(tr, abs(or_bars[i]["high"] - prev_c), abs(or_bars[i]["low"] - prev_c))
+                    trs.append(tr)
+                atr = (sum(trs) / len(trs)) if trs else (or_high - or_low) / 2.0
 
                 max_risk_usd = float(config.get("max_loss_per_trade_usd", 20.0))
                 max_pos_usd = float(config.get("max_order_usd", 500.0))
+
+                # Structural Volatility-Buffered Stop:
+                # Use Range Low if reasonable risk, else entry - 1.5 * ATR
+                range_low_risk = entry_price - or_low
+                if range_low_risk > 0.05 and (max_risk_usd / range_low_risk) >= 1:
+                    stop_price = round(or_low - 0.02, 2)
+                else:
+                    stop_price = round(entry_price - max((or_high - or_mid), 1.5 * atr), 2)
+
+                risk_per_share = entry_price - stop_price
+                if risk_per_share <= 0.05:
+                    continue
 
                 shares_by_risk = int(max_risk_usd / risk_per_share)
                 shares_by_cap = int(max_pos_usd / entry_price)
@@ -414,12 +498,18 @@ def run_session(config):
                 target_price = round(entry_price + (risk_per_share * float(config.get("min_reward_risk", 1.5))), 2)
 
                 logger.info(f"*** BREAKOUT DETECTED: {sym} ***")
-                logger.info(f"Range: [${or_low:.2f} - ${or_high:.2f}] | Breakout Close: ${entry_price:.2f}")
-                logger.info(f"Size: {shares} shares | Total Risk: ${shares * risk_per_share:.2f} | SL: ${stop_price:.2f} | TP: ${target_price:.2f}")
+                logger.info(f"Range: [${or_low:.2f} - ${or_high:.2f}] | ATR: ${atr:.2f} | Breakout Close: ${entry_price:.2f}")
+                logger.info(f"Size: {shares} shares | Risk: ${shares * risk_per_share:.2f} | SL: ${stop_price:.2f} | TP: ${target_price:.2f}")
 
                 order = submit_bracket_order(sym, shares, entry_price, stop_price, target_price)
                 if order:
                     traded_symbols.add(sym)
+                    active_trades[sym] = {
+                        "entry": entry_price,
+                        "initial_stop": stop_price,
+                        "target": target_price,
+                        "be_moved": False
+                    }
                     trades_today += 1
 
                 if trades_today >= max_trades:
