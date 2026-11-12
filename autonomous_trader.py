@@ -247,7 +247,10 @@ def send_daily_summary(starting_equity, trades_today, symbols_traded):
 
 
 def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
-    """Submit a bracket order to Alpaca Paper Trading API."""
+    """Submit a bracket order to Alpaca Paper Trading API with idempotent client_order_id."""
+    today_str = datetime.now(timezone(timedelta(hours=-5))).strftime("%Y%m%d")
+    client_id = f"ORB_{symbol}_{today_str}_{int(entry_price * 100)}"
+
     payload = {
         "symbol": symbol,
         "qty": str(qty),
@@ -255,6 +258,7 @@ def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
         "type": "market",
         "time_in_force": "day",
         "order_class": "bracket",
+        "client_order_id": client_id,
         "take_profit": {
             "limit_price": f"{target_price:.2f}"
         },
@@ -361,6 +365,13 @@ def run_session(config):
         if trades_today >= max_trades:
             logger.info(f"Daily trade limit reached ({trades_today}/{max_trades}). Monitoring...")
             time.sleep(120)
+            continue
+
+        # Failover Check: If running on Cloud and Laptop is active, stay in Standby
+        is_laptop_fn = getattr(sys.modules.get("autonomous_trader"), "is_laptop_active", None)
+        if is_laptop_fn and is_laptop_fn():
+            logger.info(f"[STANDBY] Laptop heartbeat is active. Cloud holding back in standby (NY {time_et})...")
+            time.sleep(30)
             continue
 
         logger.info(f"[Scanning] Active session NY {time_et}. Evaluating {len(symbols)} tickers for ORB breakout...")

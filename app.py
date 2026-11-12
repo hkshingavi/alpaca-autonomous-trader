@@ -2,18 +2,49 @@
 """
 Web Server & Health Dashboard for Alpaca Autonomous Day Trader
 Compatible with Koyeb, Render, Railway, Docker, and local execution.
+Includes Heartbeat Failover System (Laptop Primary / Cloud Standby).
 """
 
 import os
 import sys
+import time
 import json
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import autonomous_trader
 
 PORT = int(os.environ.get("PORT", 8000))
+last_laptop_heartbeat = 0.0
+
+def is_laptop_active():
+    """Returns True if laptop sent a heartbeat within last 90 seconds."""
+    global last_laptop_heartbeat
+    return (time.time() - last_laptop_heartbeat) < 90
+
+# Expose to autonomous_trader module
+autonomous_trader.is_laptop_active = is_laptop_active
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        global last_laptop_heartbeat
+        if self.path == "/heartbeat":
+            last_laptop_heartbeat = time.time()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            status = {
+                "status": "ok",
+                "role": "cloud_standby",
+                "laptop_status": "active_primary",
+                "timestamp": autonomous_trader.datetime.now(autonomous_trader.timezone.utc).isoformat()
+            }
+            self.wfile.write(json.dumps(status).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
@@ -22,6 +53,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status = {
                 "status": "healthy",
                 "service": "alpaca-autonomous-trader",
+                "laptop_active": is_laptop_active(),
+                "cloud_role": "standby" if is_laptop_active() else "active_primary",
                 "timestamp": autonomous_trader.datetime.now(autonomous_trader.timezone.utc).isoformat()
             }
             self.wfile.write(json.dumps(status).encode("utf-8"))
@@ -52,6 +85,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         status_badge = "<span class='badge bg-success'>MARKET OPEN</span>" if is_open else "<span class='badge bg-secondary'>MARKET CLOSED</span>"
 
+        if is_laptop_active():
+            sec_ago = int(time.time() - last_laptop_heartbeat)
+            failover_badge = f"<span class='badge bg-warning text-dark'>💻 PRIMARY: LAPTOP (Ping {sec_ago}s ago) | CLOUD: STANDBY</span>"
+        else:
+            failover_badge = "<span class='badge bg-primary'>☁️ PRIMARY: CLOUD ACTIVE (Laptop Offline / Asleep)</span>"
+
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -59,7 +98,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Alpaca Autonomous Day Trader</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <meta http-equiv="refresh" content="30">
+    <meta http-equiv="refresh" content="15">
     <style>
         body {{ background-color: #0d1117; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
         .card {{ background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; }}
@@ -75,9 +114,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <div class="d-flex justify-content-between align-items-center mb-4 pb-2 border-bottom border-secondary">
             <div>
                 <h3 class="mb-0 text-white">⚡ Alpaca Autonomous Day Trader</h3>
-                <small class="text-secondary">Cloud-Hosted on Koyeb | Opening Range Breakout (ORB)</small>
+                <small class="text-secondary">Hybrid Failover: Laptop & Render Cloud | Opening Range Breakout (ORB)</small>
             </div>
             <div>
+                {failover_badge}
                 {status_badge}
             </div>
         </div>
@@ -115,7 +155,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <span>Live Trading Activity & Logs</span>
-                        <span class="badge bg-dark border border-secondary text-secondary">Auto-refreshes every 30s</span>
+                        <span class="badge bg-dark border border-secondary text-secondary">Auto-refreshes every 15s</span>
                     </div>
                     <div class="card-body">
                         <div class="log-box">
@@ -151,7 +191,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Silence default HTTP server access logs to keep console clean
         return
 
 
@@ -162,9 +201,6 @@ def start_server():
 
 
 if __name__ == "__main__":
-    # Start trading loop in background thread
     t = threading.Thread(target=autonomous_trader.start_trading_loop, daemon=True)
     t.start()
-
-    # Run HTTP dashboard in main thread
     start_server()
