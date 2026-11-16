@@ -57,9 +57,9 @@ def load_config():
         "max_position_pct": 50.0,
         "max_order_usd": float(os.environ.get("MAX_ORDER_USD", 500.0)),
         "min_reward_risk": 1.5,
-        "no_entries_before": "09:45",
-        "no_entries_after": "10:30",
-        "flat_by": "15:55",
+        "no_entries_before": os.environ.get("NO_ENTRIES_BEFORE", "09:45"),
+        "no_entries_after": os.environ.get("NO_ENTRIES_AFTER", "10:30"),
+        "flat_by": os.environ.get("FLAT_BY", "15:55"),
         "paper": os.environ.get("ALPACA_PAPER_TRADE", "true").lower() in ("true", "1", "yes"),
         "tickers": ["NVDA", "AMZN", "INTC", "AAPL", "MSFT", "AMD", "PLTR", "TSLA"]
     }
@@ -246,6 +246,21 @@ def send_daily_summary(starting_equity, trades_today, symbols_traded):
     send_telegram_alert(msg)
 
 
+def find_stop_order(open_orders, symbol):
+    """Find the open stop-loss order for a given symbol, searching top-level orders and nested legs."""
+    if not open_orders:
+        return None
+    for o in open_orders:
+        if o.get("symbol") == symbol and o.get("side") == "sell":
+            if o.get("type") == "stop" or o.get("order_type") == "stop" or o.get("stop_price") is not None:
+                return o
+        for leg in o.get("legs") or []:
+            if leg.get("symbol") == symbol and leg.get("side") == "sell":
+                if leg.get("type") == "stop" or leg.get("order_type") == "stop" or leg.get("stop_price") is not None:
+                    return leg
+    return None
+
+
 def check_and_update_breakeven(active_trades):
     """
     Check if any active position has gained +1R.
@@ -255,28 +270,32 @@ def check_and_update_breakeven(active_trades):
         return
 
     positions = alpaca_request("/positions") or []
-    if not positions:
-        return
-
-    open_orders = alpaca_request("/orders?status=open") or []
     pos_dict = {p.get("symbol"): p for p in positions}
+    open_orders = alpaca_request("/orders?status=open") or []
+
+    # Clean up closed positions from active_trades
+    for sym in list(active_trades.keys()):
+        if sym not in pos_dict:
+            logger.info(f"Position for {sym} is no longer open (closed/stopped/target hit). Removing from active monitoring.")
+            del active_trades[sym]
 
     # Auto-adopt active positions from Alpaca if not tracked yet (e.g. after restart or failover)
     for sym, pos in pos_dict.items():
         if sym not in active_trades:
-            for o in open_orders:
-                if o.get("symbol") == sym and o.get("side") == "sell" and (o.get("type") == "stop" or o.get("order_type") == "stop" or o.get("stop_price") is not None):
-                    stop_px = float(o.get("stop_price") or 0.0)
-                    entry_px = float(pos.get("avg_entry_price") or 0.0)
-                    if stop_px > 0 and entry_px > stop_px:
-                        active_trades[sym] = {
-                            "entry": entry_px,
-                            "initial_stop": stop_px,
-                            "target": 0.0,
-                            "be_moved": False
-                        }
-                        logger.info(f"Adopted active trade for {sym} (Entry: ${entry_px:.2f}, SL: ${stop_px:.2f})")
-                    break
+            stop_order = find_stop_order(open_orders, sym)
+            if stop_order:
+                stop_px = float(stop_order.get("stop_price") or 0.0)
+                entry_px = float(pos.get("avg_entry_price") or 0.0)
+                if stop_px > 0 and entry_px > 0:
+                    be_already_set = stop_px >= round(entry_px + 0.02, 2)
+                    active_trades[sym] = {
+                        "entry": entry_px,
+                        "initial_stop": stop_px,
+                        "target": 0.0,
+                        "be_moved": be_already_set
+                    }
+                    status_note = "with BE already active" if be_already_set else f"SL: ${stop_px:.2f}"
+                    logger.info(f"Adopted active trade for {sym} (Entry: ${entry_px:.2f}, {status_note})")
 
     for symbol, trade in list(active_trades.items()):
         if trade.get("be_moved"):
@@ -298,16 +317,17 @@ def check_and_update_breakeven(active_trades):
 
         # Has the stock gained +1R?
         if current_px >= target_1r:
-            # Find the matching open stop-loss order
-            stop_order = None
-            for o in open_orders:
-                if o.get("symbol") == symbol and o.get("side") == "sell" and (o.get("type") == "stop" or o.get("order_type") == "stop" or o.get("stop_price") is not None):
-                    stop_order = o
-                    break
+            new_stop = round(entry_px + 0.02, 2)  # Entry + 2 cents to cover regulatory fees
+            stop_order = find_stop_order(open_orders, symbol)
 
             if stop_order and "id" in stop_order:
+                current_stop = float(stop_order.get("stop_price") or 0.0)
+                if current_stop >= new_stop:
+                    trade["be_moved"] = True
+                    logger.info(f"Stop-Loss for {symbol} is already at/above break-even (${current_stop:.2f} >= ${new_stop:.2f}). Marked active.")
+                    continue
+
                 stop_order_id = stop_order["id"]
-                new_stop = round(entry_px + 0.02, 2)  # Entry + 2 cents to cover regulatory fees
                 logger.info(f"*** +1R REACHED FOR {symbol} (${current_px:.2f} >= ${target_1r:.2f}) ***")
                 logger.info(f"Modifying Stop-Loss order {stop_order_id[:8]} from ${initial_stop:.2f} to Break-Even (${new_stop:.2f})...")
 
@@ -324,6 +344,8 @@ def check_and_update_breakeven(active_trades):
                         f"• Stop Moved To: *${new_stop:.2f}* (Entry + $0.02)\n"
                         f"• Remaining Risk: *$0.00 (Risk-Free Trade!)*"
                     )
+                else:
+                    logger.error(f"[ERROR] Failed to update Stop-Loss order {stop_order_id} for {symbol} to ${new_stop:.2f}")
 
 
 def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
@@ -367,7 +389,7 @@ def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
 def flatten_all_positions(max_wait_seconds=60):
     """Liquidate all open positions and cancel open orders at end of day.
     Uses ?cancel_orders=true and polls until all positions are confirmed 0.
-    Does NOT call DELETE /orders immediately, preventing race condition cancellation of liquidation market orders.
+    Does NOT call DELETE /orders immediately or on timeout, preventing race condition cancellation of liquidation market orders.
     """
     logger.info("Auto-flatten triggered: Closing all open positions (cancel_orders=true)...")
     resp = alpaca_request("/positions?cancel_orders=true", method="DELETE")
@@ -375,6 +397,8 @@ def flatten_all_positions(max_wait_seconds=60):
 
     start_time = time.time()
     confirmed_zero = False
+    re_attempted = False
+
     while time.time() - start_time < max_wait_seconds:
         positions = alpaca_request("/positions")
         if positions is None:
@@ -384,19 +408,29 @@ def flatten_all_positions(max_wait_seconds=60):
             confirmed_zero = True
             logger.info(f"Auto-flatten confirmed: 0 open positions remaining after {int(time.time() - start_time)}s.")
             break
+
+        # If still open after 20s, re-send liquidation request in case first call timed out/dropped
+        if not re_attempted and (time.time() - start_time) > 20:
+            logger.warning(f"{len(positions)} positions still liquidating after 20s. Re-issuing DELETE /positions?cancel_orders=true...")
+            alpaca_request("/positions?cancel_orders=true", method="DELETE")
+            re_attempted = True
+
         logger.info(f"Auto-flatten in progress: {len(positions)} positions still liquidating... waiting 2s")
         time.sleep(2)
 
-    if not confirmed_zero:
-        logger.warning(f"Auto-flatten verification timed out after {max_wait_seconds}s!")
-
-    # Verify and clear any remaining open orders after positions are confirmed closed
-    open_orders = alpaca_request("/orders?status=open") or []
-    if open_orders:
-        logger.info(f"Canceling {len(open_orders)} remaining open orders after positions confirmed closed...")
-        alpaca_request("/orders", method="DELETE")
+    if confirmed_zero:
+        # Verify and clear any remaining open orders strictly after positions are confirmed 0
+        open_orders = alpaca_request("/orders?status=open") or []
+        if open_orders:
+            logger.info(f"Canceling {len(open_orders)} remaining open orders after positions confirmed closed...")
+            alpaca_request("/orders", method="DELETE")
+        else:
+            logger.info("All open orders confirmed cleared.")
     else:
-        logger.info("All open orders confirmed cleared.")
+        logger.error(
+            f"Auto-flatten verification timed out after {max_wait_seconds}s! "
+            f"Skipping DELETE /orders to prevent canceling active liquidation orders."
+        )
 
 
 def run_session(config):
@@ -453,13 +487,18 @@ def run_session(config):
             continue
 
         # Case 3: Flat-by time reached (>= 15:55)
-        if time_et >= config.get("flat_by", "15:55"):
-            logger.info(f"Cutoff time reached (NY {time_et} >= {config['flat_by']}). Flattening portfolio...")
+        flat_by_time = config.get("flat_by", "15:55")
+        if time_et >= flat_by_time:
+            logger.info(f"Cutoff time reached (NY {time_et} >= {flat_by_time}). Flattening portfolio...")
             flatten_all_positions()
             time.sleep(5)
             send_daily_summary(starting_equity, trades_today, list(traded_symbols))
-            logger.info("Session complete for today. Sleeping until next open...")
-            time.sleep(300)
+            logger.info("Session complete for today. Waiting until market close...")
+            while True:
+                clk = get_market_clock()
+                if not clk or not clk.get("is_open", False):
+                    break
+                time.sleep(30)
             break
 
         # Check and manage open trades (Move stop to Break-Even at +1R)
