@@ -58,7 +58,7 @@ def load_config():
         "max_order_usd": float(os.environ.get("MAX_ORDER_USD", 500.0)),
         "min_reward_risk": 1.5,
         "no_entries_before": "09:45",
-        "no_entries_after": "15:30",
+        "no_entries_after": "10:30",
         "flat_by": "15:55",
         "paper": os.environ.get("ALPACA_PAPER_TRADE", "true").lower() in ("true", "1", "yes"),
         "tickers": ["NVDA", "AMZN", "INTC", "AAPL", "MSFT", "AMD", "PLTR", "TSLA"]
@@ -249,9 +249,9 @@ def send_daily_summary(starting_equity, trades_today, symbols_traded):
 def check_and_update_breakeven(active_trades):
     """
     Check if any active position has gained +1R.
-    If so, update the open stop-loss order on Alpaca to entry price (Break-Even).
+    If so, automatically update the open stop-loss order on Alpaca to entry price + $0.02 (Break-Even).
     """
-    if not active_trades:
+    if active_trades is None:
         return
 
     positions = alpaca_request("/positions") or []
@@ -261,6 +261,23 @@ def check_and_update_breakeven(active_trades):
     open_orders = alpaca_request("/orders?status=open") or []
     pos_dict = {p.get("symbol"): p for p in positions}
 
+    # Auto-adopt active positions from Alpaca if not tracked yet (e.g. after restart or failover)
+    for sym, pos in pos_dict.items():
+        if sym not in active_trades:
+            for o in open_orders:
+                if o.get("symbol") == sym and o.get("side") == "sell" and (o.get("type") == "stop" or o.get("order_type") == "stop" or o.get("stop_price") is not None):
+                    stop_px = float(o.get("stop_price") or 0.0)
+                    entry_px = float(pos.get("avg_entry_price") or 0.0)
+                    if stop_px > 0 and entry_px > stop_px:
+                        active_trades[sym] = {
+                            "entry": entry_px,
+                            "initial_stop": stop_px,
+                            "target": 0.0,
+                            "be_moved": False
+                        }
+                        logger.info(f"Adopted active trade for {sym} (Entry: ${entry_px:.2f}, SL: ${stop_px:.2f})")
+                    break
+
     for symbol, trade in list(active_trades.items()):
         if trade.get("be_moved"):
             continue
@@ -269,8 +286,8 @@ def check_and_update_breakeven(active_trades):
         if not pos:
             continue
 
-        entry_px = float(trade["entry"])
-        initial_stop = float(trade["initial_stop"])
+        entry_px = float(pos.get("avg_entry_price", trade.get("entry", 0.0)))
+        initial_stop = float(trade.get("initial_stop", 0.0))
         risk = entry_px - initial_stop
 
         if risk <= 0:
@@ -284,7 +301,7 @@ def check_and_update_breakeven(active_trades):
             # Find the matching open stop-loss order
             stop_order = None
             for o in open_orders:
-                if o.get("symbol") == symbol and o.get("side") == "sell" and o.get("type") == "stop":
+                if o.get("symbol") == symbol and o.get("side") == "sell" and (o.get("type") == "stop" or o.get("order_type") == "stop" or o.get("stop_price") is not None):
                     stop_order = o
                     break
 
@@ -292,19 +309,19 @@ def check_and_update_breakeven(active_trades):
                 stop_order_id = stop_order["id"]
                 new_stop = round(entry_px + 0.02, 2)  # Entry + 2 cents to cover regulatory fees
                 logger.info(f"*** +1R REACHED FOR {symbol} (${current_px:.2f} >= ${target_1r:.2f}) ***")
-                logger.info(f"Modifying Stop-Loss from ${initial_stop:.2f} to Break-Even (${new_stop:.2f})...")
+                logger.info(f"Modifying Stop-Loss order {stop_order_id[:8]} from ${initial_stop:.2f} to Break-Even (${new_stop:.2f})...")
 
                 patch_payload = {"stop_price": f"{new_stop:.2f}"}
                 resp = alpaca_request(f"/orders/{stop_order_id}", method="PATCH", body=patch_payload)
 
                 if resp and "id" in resp:
                     trade["be_moved"] = True
-                    logger.info(f"[SUCCESS] Break-Even Stop confirmed on Alpaca! New Order ID: {resp['id']}")
+                    logger.info(f"[SUCCESS] Break-Even Stop confirmed on Alpaca! Updated Order ID: {resp['id']}")
                     send_telegram_alert(
                         f"🛡️ *Break-Even Protection Activated!*\n"
                         f"• Stock: *{symbol}*\n"
-                        f"• Current Price: *${current_px:.2f}* (+1R Milestone)\n"
-                        f"• Stop Moved To: *${new_stop:.2f}* (Entry)\n"
+                        f"• Current Price: *${current_px:.2f}* (+1R Milestone reached)\n"
+                        f"• Stop Moved To: *${new_stop:.2f}* (Entry + $0.02)\n"
                         f"• Remaining Risk: *$0.00 (Risk-Free Trade!)*"
                     )
 
@@ -347,13 +364,39 @@ def submit_bracket_order(symbol, qty, entry_price, stop_price, target_price):
         return None
 
 
-def flatten_all_positions():
-    """Liquidate all open positions and cancel open orders at end of day."""
-    logger.info("Auto-flatten triggered: Closing all open positions...")
-    resp = alpaca_request("/positions", method="DELETE")
-    logger.info(f"Flatten response: {resp}")
-    alpaca_request("/orders", method="DELETE")
-    logger.info("All open orders canceled.")
+def flatten_all_positions(max_wait_seconds=60):
+    """Liquidate all open positions and cancel open orders at end of day.
+    Uses ?cancel_orders=true and polls until all positions are confirmed 0.
+    Does NOT call DELETE /orders immediately, preventing race condition cancellation of liquidation market orders.
+    """
+    logger.info("Auto-flatten triggered: Closing all open positions (cancel_orders=true)...")
+    resp = alpaca_request("/positions?cancel_orders=true", method="DELETE")
+    logger.info(f"Liquidation response: {resp}")
+
+    start_time = time.time()
+    confirmed_zero = False
+    while time.time() - start_time < max_wait_seconds:
+        positions = alpaca_request("/positions")
+        if positions is None:
+            time.sleep(2)
+            continue
+        if len(positions) == 0:
+            confirmed_zero = True
+            logger.info(f"Auto-flatten confirmed: 0 open positions remaining after {int(time.time() - start_time)}s.")
+            break
+        logger.info(f"Auto-flatten in progress: {len(positions)} positions still liquidating... waiting 2s")
+        time.sleep(2)
+
+    if not confirmed_zero:
+        logger.warning(f"Auto-flatten verification timed out after {max_wait_seconds}s!")
+
+    # Verify and clear any remaining open orders after positions are confirmed closed
+    open_orders = alpaca_request("/orders?status=open") or []
+    if open_orders:
+        logger.info(f"Canceling {len(open_orders)} remaining open orders after positions confirmed closed...")
+        alpaca_request("/orders", method="DELETE")
+    else:
+        logger.info("All open orders confirmed cleared.")
 
 
 def run_session(config):
@@ -419,14 +462,15 @@ def run_session(config):
             time.sleep(300)
             break
 
-        # Case 4: Past entry cutoff (>= 15:30)
-        if time_et >= config.get("no_entries_after", "15:30"):
-            logger.info(f"Time {time_et} past entry cutoff. Managing positions until flat_by...")
-            time.sleep(60)
-            continue
-
         # Check and manage open trades (Move stop to Break-Even at +1R)
         check_and_update_breakeven(active_trades)
+
+        # Case 4: Past entry cutoff (>= 10:30)
+        cutoff_time = config.get("no_entries_after", "10:30")
+        if time_et >= cutoff_time:
+            logger.info(f"Time {time_et} past entry cutoff ({cutoff_time}). Monitoring open positions until {config.get('flat_by', '15:55')}...")
+            time.sleep(60)
+            continue
 
         # Case 5: Daily trade limit reached
         if trades_today >= max_trades:
